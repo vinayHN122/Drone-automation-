@@ -1,10 +1,9 @@
-#!/home/yuhang/anaconda3/bin/python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import
 from __future__ import print_function
 
 import torch
-import rospy
 import torch.optim as optim
 import torch.nn as nn
 import torch.nn.functional as F
@@ -52,7 +51,7 @@ class DQNNet(nn.Module):
 
     def forward(self, state1, state2):
         batch_size = state1.size(0)
-        img = state1 / 255
+        img = state1 / 255.0
         x1 = F.relu(self.cnn_1(img.transpose(1, 3)))
         x2 = F.relu(self.cnn_2(x1))
         x3 = self.pool_1(x2)
@@ -64,8 +63,7 @@ class DQNNet(nn.Module):
         fc_2 = F.relu(self.fc_2(fc_1))
         fc_3 = F.relu(self.fc_2(fc_2))
 
-        # Dueling DQN--Split the output
-        # 改变算法得改变DQNNET网络参数 / DQN算法参数
+        # Dueling DQN -- Split the output
         if self.network == "Duel":
             advantage, value = torch.split(fc_3, 128, dim=1)
             advantage = self.advantage(advantage)
@@ -83,16 +81,17 @@ class DQN():
         self.env = env
         self.network = network
 
-        # Torch
+        # Torch device
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        print(self.device)
+        print(f"Using device: {self.device}")
+
         # Deep Q network
-        self.predict_net = DQNNet(network='DQN').to(self.device)
+        self.predict_net = DQNNet(network=self.network).to(self.device)
         self.optimizer = optim.Adam(self.predict_net.parameters(), lr=learning_rate)
         self.loss_fn = nn.MSELoss()
 
         # Target network
-        self.target_net = DQNNet(network='DQN').to(self.device)
+        self.target_net = DQNNet(network=self.network).to(self.device)
         self.target_net.load_state_dict(self.predict_net.state_dict())
         self.target_update = target_update
         self.update_count = 0
@@ -109,22 +108,22 @@ class DQN():
         self.eps_min = eps_min
         self.eps_period = eps_period
 
-        # Select the algorithm
+        # Select the algorithm type
         if self.network == "DQN":
-            print("DQN")
+            print("Using DQN")
         elif self.network == "Double":
-            print("DDQN")
+            print("Using Double DQN")
         elif self.network == "Duel":
-            print("Duel")
+            print("Using Dueling DQN")
 
     # Get the action
     def get_action(self, state1, state2):
-        # Random action
+        # Random action for exploration
         if np.random.rand() < self.eps:
-            self.eps = self.eps - (1 - self.eps_min) / self.eps_period if self.eps > self.eps_min else self.eps_min
+            self.eps = max(self.eps - (1 - self.eps_min) / self.eps_period, self.eps_min)
             return np.random.randint(0, 5)
 
-        # Get the action
+        # Use the network to get the action
         state1 = torch.FloatTensor(state1).to(self.device).unsqueeze(0)
         state2 = torch.FloatTensor(state2).to(self.device).unsqueeze(0)
         q_values = self.predict_net(state1, state2).cpu().detach().numpy()
@@ -132,8 +131,11 @@ class DQN():
 
         return action
 
-    # Learn the policy
+    # Learn/update the network
     def learn(self):
+        if len(self.replay_buffer.memory) < self.batch_size:
+            return
+
         states1, states2, actions, rewards, next_states1, next_states2, dones = self.replay_buffer.sample(self.batch_size)
         states1 = torch.FloatTensor(states1).to(self.device)
         states2 = torch.FloatTensor(states2).to(self.device)
@@ -142,29 +144,33 @@ class DQN():
         next_states1 = torch.FloatTensor(next_states1).to(self.device)
         next_states2 = torch.FloatTensor(next_states2).to(self.device)
         dones = torch.FloatTensor(dones).to(self.device)
-        # Calculate values and target values
-        if self.network == 'Duel' or self.network == 'Double':
+
+        if self.network in ['Duel', 'Double']:
+            # Double DQN or Dueling DQN update
             _, actions_prime = torch.max(self.predict_net(next_states1, next_states2), 1)
             q_target_value = self.target_net(next_states1, next_states2).gather(1, actions_prime.view(-1, 1))
-            target_values = (rewards.view(-1, 1) + self.gamma * q_target_value * (1 - dones).view(-1, 1))
+            target_values = rewards.view(-1, 1) + self.gamma * q_target_value * (1 - dones).view(-1, 1)
             predict_values = self.predict_net(states1, states2).gather(1, actions.view(-1, 1))
         else:
-            target_values = (rewards + self.gamma * torch.max(self.target_net(next_states1, next_states2), 1)[0] * (
-                        1 - dones)).view(-1, 1)
+            # Standard DQN update
+            target_values = rewards + self.gamma * torch.max(self.target_net(next_states1, next_states2), 1)[0] * (1 - dones)
+            target_values = target_values.view(-1, 1)
             predict_values = self.predict_net(states1, states2).gather(1, actions.view(-1, 1))
-        # Calculate the loss and optimize the network
+
         loss = self.loss_fn(predict_values, target_values)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-        # Update the target network
+
         self.update_count += 1
-        if self.update_count == self.target_update:
+        if self.update_count >= self.target_update:
             self.target_net.load_state_dict(self.predict_net.state_dict())
             self.update_count = 0
 
     def save_model(self, filename):
         torch.save(self.predict_net.state_dict(), filename)
 
-    def load_model(self, filename, map_location):
-        self.predict_net.load_state_dict(torch.load(filename, map_location=torch.device('cpu')), strict=False)
+    def load_model(self, filename, map_location=None):
+        map_location = torch.device('cpu') if map_location is None else map_location
+        self.predict_net.load_state_dict(torch.load(filename, map_location=map_location), strict=False)
+
